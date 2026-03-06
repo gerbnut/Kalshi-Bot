@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,56 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 logger = logging.getLogger(__name__)
+
+_SERIES_TO_CITY = {v: k for k, v in config.WEATHER_SERIES.items()}
+_DATE_MONTHS = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def _parse_held_position(ticker: str):
+    """Parse a Kalshi position ticker into (city_key, date_str), or None if not a weather market."""
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    city_key = _SERIES_TO_CITY.get(parts[0])
+    if not city_key:
+        return None
+    match = re.match(r"(\d{2})([A-Z]{3})(\d{2})$", parts[1])
+    if not match:
+        return None
+    month_num = _DATE_MONTHS.get(match.group(2))
+    if not month_num:
+        return None
+    return city_key, f"20{match.group(1)}-{month_num}-{match.group(3)}"
+
+
+def _get_held_sets(client) -> tuple[set, set]:
+    """Fetch open positions and return (held_tickers, held_city_dates).
+    Returns empty sets on failure so trading is never blocked by an API error.
+    """
+    try:
+        pos_data = client.get_positions()
+        pos_list = pos_data.get("market_positions", []) or pos_data.get("positions", [])
+        held_tickers = set()
+        held_city_dates = set()
+        for p in pos_list:
+            qty = p.get("position", p.get("quantity", 0)) or 0
+            if qty <= 0:
+                continue
+            ticker = p.get("ticker", "")
+            held_tickers.add(ticker)
+            parsed = _parse_held_position(ticker)
+            if parsed:
+                held_city_dates.add(parsed)
+        if held_tickers:
+            logger.info(f"main: holding {len(held_tickers)} position(s): {', '.join(sorted(held_tickers))}")
+        return held_tickers, held_city_dates
+    except Exception as e:
+        logger.warning(f"main: get_positions failed, skipping held-position filter: {e}")
+        return set(), set()
 
 
 def main():
@@ -97,11 +148,27 @@ def main():
                     current_balance = bal.get("balance", initial_balance)
                 except Exception:
                     current_balance = initial_balance
-                alerting.alert_daily_summary(scan_count, session_orders, current_balance, pnl_stats)
+                try:
+                    pos_data = client.get_positions()
+                    positions = pos_data.get("market_positions", []) or pos_data.get("positions", [])
+                except Exception:
+                    positions = None
+                alerting.alert_daily_summary(scan_count, session_orders, current_balance, pnl_stats, positions)
                 last_summary_day = today
 
             # Daily Reddit research (runs once per day, non-blocking on failure)
             reddit_research.research_today_if_needed()
+
+            # Fetch fresh balance and held positions at the start of each scan
+            scan_balance = current_balance
+            try:
+                bal = client.get_balance()
+                scan_balance = bal.get("balance", current_balance)
+                current_balance = scan_balance
+            except Exception:
+                pass
+            held_tickers, held_city_dates = _get_held_sets(client)
+            print(f"  Balance: {cents_to_dollars(scan_balance)}  |  Held: {len(held_tickers)}")
 
             # Scan → Forecast → Evaluate
             try:
@@ -116,18 +183,23 @@ def main():
                 scan_logger.log_error("fetch_forecasts", e)
                 forecasts = {}
 
-            # Compute account-relative position limits
-            effective_trade = max(config.MAX_TRADE_CENTS, int(current_balance * config.MAX_TRADE_PCT))
-            effective_exposure = max(config.MAX_EXPOSURE_CENTS, int(current_balance * config.MAX_EXPOSURE_PCT))
+            # Compute account-relative position limits (hard caps — balance check is additional)
+            effective_trade = max(config.MAX_TRADE_CENTS, int(scan_balance * config.MAX_TRADE_PCT))
+            effective_exposure = max(config.MAX_EXPOSURE_CENTS, int(scan_balance * config.MAX_EXPOSURE_PCT))
 
             try:
-                signals, skipped_details = strategy.evaluate(markets, forecasts, effective_trade, effective_exposure)
+                signals, skipped_details = strategy.evaluate(
+                    markets, forecasts, effective_trade, effective_exposure,
+                    available_balance_cents=scan_balance,
+                    held_tickers=held_tickers,
+                    held_city_dates=held_city_dates,
+                )
             except Exception as e:
                 scan_logger.log_error("strategy.evaluate", e)
                 signals, skipped_details = [], []
 
-            # Execute
-            executed = executor.execute_signals(client, signals)
+            # Execute — pass balance so executor tracks spend in real time
+            executed, remaining_balance = executor.execute_signals(client, signals, scan_balance)
 
             # Alert on each trade result
             for e in executed:
@@ -137,6 +209,7 @@ def main():
                     alerting.alert_trade_placed(
                         e["ticker"], e["count"], e["limit_price"],
                         e.get("order_id"), e.get("status"),
+                        balance_after=e.get("balance_after"),
                     )
 
             successful = [e for e in executed if e.get("status") != "error"]
@@ -145,12 +218,18 @@ def main():
             # Exposure = sum of executed trade costs
             exposure_cents = sum(e["count"] * e["limit_price"] for e in successful)
 
-            # Try to get current balance
+            # Post-scan balance summary
+            if successful:
+                remaining_str = cents_to_dollars(remaining_balance) if remaining_balance is not None else "unknown"
+                print(f"  Scan summary: started={cents_to_dollars(scan_balance)}  "
+                      f"allocated={cents_to_dollars(exposure_cents)}  remaining={remaining_str}")
+
+            # Update current_balance from API (ground truth for next scan)
             try:
                 bal = client.get_balance()
-                current_balance = bal.get("balance", initial_balance)
+                current_balance = bal.get("balance", current_balance)
             except Exception:
-                current_balance = initial_balance
+                pass
 
             # Log scan
             scan_logger.log_scan(
@@ -162,15 +241,6 @@ def main():
                 balance_cents=current_balance,
                 exposure_cents=exposure_cents,
             )
-
-            # First-scan Discord summary (confirms pipeline is working)
-            if scan_count == 1:
-                alerting.alert_first_scan_summary(
-                    scan_num=scan_count,
-                    markets_found=len(markets),
-                    signals_count=len(signals),
-                    skip_reasons=skipped_details,
-                )
 
             # P&L update every scan (tries to resolve newly settled markets)
             try:

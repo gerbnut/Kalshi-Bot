@@ -43,8 +43,14 @@ class WeatherMarketScanner(MarketScanner):
         ticker = m.get("ticker", "")
         subtitle = m.get("subtitle") or ""
         title = m.get("title") or ""
-        # Use yes_ask as the price we'd pay when buying
-        yes_price = m.get("yes_ask") or m.get("last_price") or 0
+        # Use yes_ask as the price we'd pay; fall back to yes_bid as a floor estimate.
+        # Never fall back to last_price (stale) or 0 (passes every filter).
+        yes_ask = m.get("yes_ask") or 0
+        yes_bid = m.get("yes_bid") or 0
+        yes_price = yes_ask or yes_bid
+        if not yes_price:
+            logger.debug(f"market_scanner: skipping {ticker} — no valid ask/bid price")
+            return None
         volume = m.get("volume", 0)
         close_time = m.get("close_time") or m.get("expiration_time", "")
 

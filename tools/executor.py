@@ -42,13 +42,16 @@ def startup_check(client) -> int:
     return balance_cents
 
 
-def execute_signals(client, signals: list[dict]) -> list[dict]:
-    """Place limit orders for each signal. Returns list of executed order records."""
+def execute_signals(client, signals: list[dict], available_balance_cents: int = None) -> tuple[list[dict], int]:
+    """Place limit orders for each signal. Returns (executed_records, remaining_balance_cents)."""
     executed = []
+    running_balance = available_balance_cents  # None if not provided
+
     for sig in signals:
         ticker = sig["ticker"]
         limit_price = sig["limit_price"]
         count = sig["count"]
+        trade_cost = count * limit_price
         try:
             resp = client.place_order(
                 ticker=ticker,
@@ -58,9 +61,12 @@ def execute_signals(client, signals: list[dict]) -> list[dict]:
             )
             order_id = resp.get("order", {}).get("order_id") or resp.get("order_id", "?")
             status = resp.get("order", {}).get("status") or resp.get("status", "?")
+            if running_balance is not None:
+                running_balance -= trade_cost
+            balance_str = f" | balance_after={cents_to_dollars(running_balance)}" if running_balance is not None else ""
             print(
                 f"  ORDER PLACED: {ticker} | {count}x @ {limit_price}¢ | "
-                f"order_id={order_id} status={status}"
+                f"order_id={order_id} status={status}{balance_str}"
             )
             logger.info(f"executor: order placed {ticker} count={count} price={limit_price}¢ resp={resp}")
             executed.append({
@@ -69,12 +75,13 @@ def execute_signals(client, signals: list[dict]) -> list[dict]:
                 "limit_price": limit_price,
                 "order_id": order_id,
                 "status": status,
+                "balance_after": running_balance,
                 "response": resp,
             })
         except Exception as e:
             logger.error(f"executor: order failed {ticker}: {e}")
             print(f"  ORDER FAILED: {ticker} — {e}")
-            # Log the failure but continue — never retry immediately
+            # Do NOT subtract from balance on failure — never retry immediately
             executed.append({
                 "ticker": ticker,
                 "count": count,
@@ -83,7 +90,8 @@ def execute_signals(client, signals: list[dict]) -> list[dict]:
                 "status": "error",
                 "error": str(e),
             })
-    return executed
+
+    return executed, running_balance
 
 
 def session_summary(client, initial_balance_cents: int):

@@ -1,5 +1,5 @@
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import requests
@@ -7,6 +7,9 @@ import requests
 import config
 
 logger = logging.getLogger(__name__)
+
+FORECAST_CACHE_MINUTES = 30
+_forecast_cache: dict = {}  # (city_key, target_date) -> {"temp", "confidence", "fetched_at"}
 
 NWS_HEADERS = {
     "User-Agent": "kalshi-weather-bot (contact@example.com)",
@@ -90,9 +93,11 @@ def score_confidence(nws_temp: Optional[float], openmeteo_temp: Optional[float])
         else:
             return consensus, 0.00
     elif nws_temp is not None:
-        return nws_temp, 0.70 - 0.15  # 0.55 — one source only
+        # Single source, no cross-validation — cap confidence
+        return nws_temp, 0.35
     elif openmeteo_temp is not None:
-        return openmeteo_temp, 0.70 - 0.15
+        # Single source, no cross-validation — cap confidence
+        return openmeteo_temp, 0.35
     else:
         return None, 0.00
 
@@ -107,21 +112,32 @@ def fetch_forecasts(markets: list[dict]) -> dict:
         unique.add((m["city_key"], m["date"]))
 
     results = {}
+    now = datetime.now(timezone.utc)
     for city_key, target_date in unique:
+        cache_key = (city_key, target_date)
+        cached = _forecast_cache.get(cache_key)
+        if cached is not None:
+            age_minutes = (now - cached["fetched_at"]).total_seconds() / 60
+            if age_minutes < FORECAST_CACHE_MINUTES:
+                logger.info(f"weather_fetcher: using cached forecast for {city_key} {target_date}")
+                results[cache_key] = {"temp": cached["temp"], "confidence": cached["confidence"]}
+                continue
+
         city = config.CITY_CONFIG.get(city_key)
         if city is None:
             logger.warning(f"weather_fetcher: no config for city {city_key}")
-            results[(city_key, target_date)] = {"temp": None, "confidence": 0.00}
+            results[cache_key] = {"temp": None, "confidence": 0.00}
             continue
 
         lat, lon, tz = city["lat"], city["lon"], city["tz"]
         nws = fetch_nws(lat, lon, target_date)
         om = fetch_open_meteo(lat, lon, target_date, tz)
         temp, conf = score_confidence(nws, om)
-        results[(city_key, target_date)] = {"temp": temp, "confidence": conf}
+        results[cache_key] = {"temp": temp, "confidence": conf}
+        _forecast_cache[cache_key] = {"temp": temp, "confidence": conf, "fetched_at": now}
         logger.info(
             f"weather_fetcher: {city_key} {target_date} "
-            f"NWS={nws} OM={om} consensus={temp:.1f if temp else 'N/A'} conf={conf:.2f}"
+            f"NWS={nws} OM={om} consensus={f'{temp:.1f}' if temp else 'N/A'} conf={conf:.2f}"
         )
 
     return results

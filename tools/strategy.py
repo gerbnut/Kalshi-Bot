@@ -20,9 +20,18 @@ class WeatherStrategy(BaseStrategy):
     """
 
     def evaluate(self, markets: list[dict], forecasts: dict,
-                 max_trade_cents: int = None, max_exposure_cents: int = None) -> tuple[list[dict], list[dict]]:
+                 max_trade_cents: int = None, max_exposure_cents: int = None,
+                 available_balance_cents: int = None,
+                 held_tickers: set = None,
+                 held_city_dates: set = None) -> tuple[list[dict], list[dict]]:
         max_trade = max_trade_cents if max_trade_cents is not None else config.MAX_TRADE_CENTS
         max_exposure = max_exposure_cents if max_exposure_cents is not None else config.MAX_EXPOSURE_CENTS
+
+        # 90% safety margin — never try to spend the last penny
+        remaining_balance = int(available_balance_cents * 0.9) if available_balance_cents is not None else None
+
+        _held_tickers = held_tickers or set()
+        _held_city_dates = held_city_dates or set()
 
         signals = []
         skipped_details = []
@@ -36,6 +45,19 @@ class WeatherStrategy(BaseStrategy):
         for c in candidates:
             if len(signals) >= config.MAX_TRADES_PER_RUN:
                 break
+
+            # Pre-filter: skip tickers we already hold (survives restarts)
+            if c["ticker"] in _held_tickers:
+                reason = "already holding position"
+                logger.info(f"strategy: SKIP {c['ticker']} — {reason}")
+                skipped_details.append({"ticker": c["ticker"], "reason": reason})
+                continue
+
+            if (c["city_key"], c["date"]) in _held_city_dates:
+                reason = "already holding position on this date"
+                logger.info(f"strategy: SKIP {c['ticker']} — {reason}")
+                skipped_details.append({"ticker": c["ticker"], "reason": reason})
+                continue
 
             skip_reason = c.get("skip_reason")
             if skip_reason:
@@ -57,8 +79,16 @@ class WeatherStrategy(BaseStrategy):
                 skipped_details.append({"ticker": c["ticker"], "reason": reason})
                 continue
 
+            if remaining_balance is not None and trade_cost > remaining_balance:
+                reason = f"insufficient balance (${remaining_balance / 100:.2f} available)"
+                logger.info(f"strategy: SKIP {c['ticker']} — {reason}")
+                skipped_details.append({"ticker": c["ticker"], "reason": reason})
+                continue
+
             seen_city_dates.add(city_date)
             total_exposure += trade_cost
+            if remaining_balance is not None:
+                remaining_balance -= trade_cost
             signals.append(c)
 
         return signals, skipped_details
@@ -132,7 +162,13 @@ class WeatherStrategy(BaseStrategy):
 
 
 def evaluate(markets: list[dict], forecasts: dict,
-             max_trade_cents: int = None, max_exposure_cents: int = None) -> tuple[list[dict], list[dict]]:
+             max_trade_cents: int = None, max_exposure_cents: int = None,
+             available_balance_cents: int = None,
+             held_tickers: set = None,
+             held_city_dates: set = None) -> tuple[list[dict], list[dict]]:
     """Top-level evaluate using WeatherStrategy (extensible). Returns (signals, skipped_details)."""
     strategy = WeatherStrategy()
-    return strategy.evaluate(markets, forecasts, max_trade_cents, max_exposure_cents)
+    return strategy.evaluate(
+        markets, forecasts, max_trade_cents, max_exposure_cents,
+        available_balance_cents, held_tickers, held_city_dates,
+    )

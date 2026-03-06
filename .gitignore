@@ -1,0 +1,8 @@
+.env
+api_keys/
+logs/
+.tmp/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
